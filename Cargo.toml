@@ -1,0 +1,9 @@
+[package]
+name = "fan"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2.161"  
+nix = { version = "0.29", features = ["sched", "fanotify", "fs"] }
+tempfile = "3.7.1"
