@@ -31,15 +31,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fan"
-version = "0.1.0"
-dependencies = [
- "libc",
- "nix",
- "tempfile",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -86,6 +77,15 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "sandbox-spawn"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "nix",
+ "tempfile",
 ]
 
 [[package]]

@@ -1,83 +1,68 @@
-use libc::AT_FDCWD;
-use nix::{
-    sched::{unshare, CloneFlags},
-    sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags},
-};
-use std::{os::fd::AsRawFd, process::Command};
+use nix::errno::Errno;
+use nix::sys::ptrace;
+use nix::sys::signal::Signal;
+use nix::sys::wait::{waitpid, WaitStatus};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Unshare the mount namespace
-     unshare(CloneFlags::CLONE_NEWNS)?;
+use nix::sys::signal::raise;
+use nix::unistd::ForkResult::{Child, Parent};
+use nix::unistd::{fork, getpid};
 
-    let group = Fanotify::init(InitFlags::FAN_CLASS_NOTIF, EventFFlags::O_RDONLY).unwrap();
+use std::os::unix::process::CommandExt;
+use std::process::Command;
 
-    // create a PathBuf pointing at /home/vscode/fan/
-    let tempfile = std::path::PathBuf::from("/home/vscode/fan");
-
-    group
-        .mark(
-            MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_MOUNT,
-            MaskFlags::FAN_MODIFY
-                | MaskFlags::FAN_CLOSE_WRITE,
-            Some(AT_FDCWD),
-            Some(&tempfile),
-        )
-        .unwrap();
-
-    // execute a child process "node index.js", place this in unsafe block
-    let mut child = Command::new("/usr/local/share/nvm/versions/node/v20.11.0/bin/node")
-        .arg("index.js")
-        .spawn()
-        .expect("failed to execute child");
-
-    let ecode = child.wait().expect("failed to wait on child");
-
-    println!("ecode: {:?}", ecode);
-
-    let events = group.read_events().unwrap();
-
-    // print out all the events
-    for event in events.iter() {
-        // print out the file name that was modified
-        let fd_opt = event.fd();
-        let fd = fd_opt.as_ref().unwrap();
-        let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
-        println!("path: {:?}", path);
-        println!("mask: {:?}", event.mask());
+fn main() {
+    let err = ptrace::attach(getpid()).unwrap_err();
+    if err == Errno::ENOSYS {
+        return;
     }
 
-    // assert!(event.check_version());
-    // assert_eq!(
-    //     event.mask(),
-    //     MaskFlags::FAN_OPEN
-    //         | MaskFlags::FAN_MODIFY
-    //         | MaskFlags::FAN_CLOSE_WRITE
-    // );
+    match unsafe { fork() }.expect("Failed to fork") {
+        Parent { child } => {
+            // Parent process
+            println!("Parent: Forked child with PID {}", child);
 
-    // let fd_opt = event.fd();
-    // let fd = fd_opt.as_ref().unwrap();
-    // let path = read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
-    // assert_eq!(path, tempfile);
+            // Monitor syscalls in a loop
+            loop {
+                match waitpid(child, None).expect("Failed to wait for child process") {
+                    WaitStatus::PtraceSyscall(pid) => {
+                        let regs = ptrace::getregs(pid).expect("Failed to get registers");
+                        let syscall = regs.orig_rax as i64;
+                        println!("Parent: Intercepted syscall {}", syscall);
 
-    // // read test file
-    // {
-    //     let mut f = File::open(&tempfile).unwrap();
-    //     let mut s = String::new();
-    //     f.read_to_string(&mut s).unwrap();
-    // }
+                        // Continue the child process to the next syscall
+                        ptrace::syscall(pid, None).expect("Failed to continue syscall");
+                    }
+                    WaitStatus::Exited(_, status) => {
+                        println!("Parent: Child exited with status {}", status);
+                        break;
+                    }
+                    _ => {}
+                }
 
-    // let mut events = group.read_events().unwrap();
-    // assert_eq!(events.len(), 1, "should have read exactly one event");
-    // let event = events.pop().unwrap();
-    // assert!(event.check_version());
-    // assert_eq!(
-    //     event.mask(),
-    //     MaskFlags::FAN_OPEN | MaskFlags::FAN_CLOSE_NOWRITE
-    // );
-    // let fd_opt = event.fd();
-    // let fd = fd_opt.as_ref().unwrap();
-    // let path = read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
-    // assert_eq!(path, tempfile);
+                ptrace::syscall(child, None).unwrap();
+            }
+        }
 
-    Ok(())
+        Child => {
+            // Child process
+            println!("Child: Started");
+
+            println!("Child: enable traceme");
+            ptrace::traceme().unwrap();
+
+            println!("Child: SIGSTOP");
+            raise(Signal::SIGSTOP).unwrap();
+
+            // Execute a simple command (e.g., "ls")
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            if args.is_empty() {
+                eprintln!("No command provided");
+                std::process::exit(1);
+            }
+
+            println!("Child: Executing command: {:?}", args);
+
+            Command::new(&args[0]).args(&args[1..]).exec();
+        }
+    }
 }

@@ -1,9 +1,9 @@
 [package]
-name = "fan"
+name = "sandbox-spawn"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 libc = "0.2.161"  
-nix = { version = "0.29", features = ["sched", "fanotify", "fs"] }
+nix = { version = "0.29", features = ["sched", "fanotify", "fs", "ptrace", "signal"] }
 tempfile = "3.7.1"
