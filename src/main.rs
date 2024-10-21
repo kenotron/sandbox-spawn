@@ -1,6 +1,8 @@
-use std::ffi::CString;
-
 use anyhow::{Context, Error};
+use std::ffi::CString;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
+
 use env_logger::Env;
 use libc::{PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK};
 use log::{debug, error, info, warn};
@@ -11,7 +13,7 @@ use nix::{
         signal::Signal,
         wait::{wait, waitpid, WaitStatus},
     },
-    unistd::{execve, fork, getpid, ForkResult, Pid},
+    unistd::{chdir, execve, fork, getpid, ForkResult, Pid},
 };
 
 fn main() {
@@ -36,36 +38,19 @@ fn run_child() {
     // the pid won't change with exec, so we ask to be traced
     ptrace::traceme().expect("OS could not be bothered to trace me");
 
-    let path = CString::new("/usr/local/share/nvm/versions/node/v20.11.0/bin/node").unwrap();
-    let args = vec![
-        CString::new("node").unwrap(),
-        CString::new("index.js").unwrap(),
-    ];
-    let env_vars: Vec<CString> = vec![];
-
-    execve(&path, &args, &env_vars).expect("Child failed to execute");
-
-    // let e = Command::new("./target/debug/testee").exec();
-
-    // let e = Command::new("./target/debug/forker").exec();
-
-    // let e = Command::new("/usr/local/share/nvm/versions/node/v20.11.0/bin/node")
-    //     .arg("index.js").exec();
-
-    // let e = Command::new("/usr/lib/jvm/java-17-openjdk/bin/java")
-    //     .arg("-jar")
-    //     .arg("jvm-test/target/jvm-test-1.0-SNAPSHOT-jar-with-dependencies.jar")
-    //     .exec();
-
-    // raise(Signal::SIGSTOP).expect("Child failed to stop itself");
+    Command::new("/usr/local/share/nvm/versions/node/v20.11.0/bin/node")
+        .arg("index.js")
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .exec();
 }
 
 fn run_parent(pid: Pid) {
     // wait for our child process to be ready
-    let ws = wait().expect("Parent failed waiting for child");
+    let ws = wait().expect("failed waiting for initial child");
     info!("Child process ready with signal: {ws:?}, will ask it to continue until syscall");
 
-    setup_tracing(pid).expect("Parent failed tracing");
+    setup_tracing(pid).expect("failed setup tracing");
     trace_syscall(pid, None).expect("Parent failed tracing");
 
     loop {
@@ -101,14 +86,30 @@ fn read_cstring(pid: nix::unistd::Pid, addr: *const i8) -> Option<String> {
     }
 }
 
+fn is_real_path(path: &str) -> bool {
+    path.starts_with("/") || path.starts_with("./") || path.starts_with("../")
+}
+
 fn wait_for_signal(child: Pid) -> Result<bool, SandboxTracerError> {
     match wait() {
-        Ok(WaitStatus::Stopped(pid_t, sig_num)) => {
-            info!("Child with pid: {} stopped with signal", pid_t);
-            // handle_child_stopped(sig_num, pid_t, msync_counter)
-            // trace_syscall(pid_t, None)
+        Ok(WaitStatus::Stopped(pid, signal)) => {
+            info!("Child with pid: {} stopped with signal {}", pid, signal);
 
-            Ok(false)
+            // ptrace::cont(pid, None).unwrap();
+
+            if signal == Signal::SIGCHLD {
+                ptrace::cont(pid, signal).unwrap();
+                Ok(pid == child)
+            } else if signal == Signal::SIGTRAP {
+                ptrace::cont(pid, None).unwrap();
+                Ok(false)
+            } else if signal == Signal::SIGSTOP {
+                ptrace::syscall(pid, None).unwrap();
+                Ok(false)
+            } else {
+                ptrace::cont(pid, signal).unwrap();
+                Ok(false)
+            }
         }
         Ok(WaitStatus::Exited(pid, exit_status)) => {
             info!("Child with pid: {} exited with status {}", pid, exit_status);
@@ -137,8 +138,16 @@ fn wait_for_signal(child: Pid) -> Result<bool, SandboxTracerError> {
             debug!("PtraceEvent - for: {}, {} ", pid, event);
 
             if event == PTRACE_EVENT_FORK {
-                info!("Child forked, will trace it");
-                trace_syscall(pid, None)?;
+                let new_pid_int = ptrace::getevent(pid).expect("Parent: Cannot get event") as i32;
+                let new_pid = Pid::from_raw(new_pid_int);
+
+                // continue on the new child process because ptrace automatically SIGSTOPs
+                waitpid(new_pid, None).unwrap();
+                info!("Child forked, will trace it {}", new_pid);
+                setup_tracing(new_pid).expect("Parent failed tracing");
+                ptrace::cont(new_pid, None).unwrap();
+
+                ptrace::syscall(pid, None).unwrap();
             } else if event == PTRACE_EVENT_VFORK {
                 info!("Child vforked, will trace it");
                 trace_syscall(pid, None)?;
@@ -146,13 +155,14 @@ fn wait_for_signal(child: Pid) -> Result<bool, SandboxTracerError> {
                 let new_pid_int = ptrace::getevent(pid).expect("Parent: Cannot get event") as i32;
                 let new_pid = Pid::from_raw(new_pid_int);
 
-                info!("Child cloned, will trace it {}", new_pid);
-
                 // continue on the new child process because ptrace automatically SIGSTOPs
+
                 waitpid(new_pid, None).unwrap();
+                info!("Child cloned, will trace it {}", new_pid);
+                setup_tracing(new_pid).expect("Parent failed tracing");
+                ptrace::cont(new_pid, None).unwrap();
 
                 ptrace::syscall(pid, None).unwrap();
-                ptrace::syscall(new_pid, None).unwrap();
             } else if event == PTRACE_EVENT_EXEC {
                 info!("Child executed, will trace it");
                 trace_syscall(pid, None)?;
@@ -175,7 +185,9 @@ fn wait_for_signal(child: Pid) -> Result<bool, SandboxTracerError> {
                 // now find the file name in /proc/[pid]/[fd]
                 let fd_path = format!("/proc/{}/fd/{}", pid, fd);
                 let filename = std::fs::read_link(fd_path).unwrap();
-                info!("[{}] Write filename = {}", pid, filename.to_str().unwrap());
+                if is_real_path(&filename.to_str().unwrap()) {
+                    info!("[{}] Write filename = {}", pid, filename.to_str().unwrap());
+                }
 
                 ptrace::syscall(pid, None).unwrap();
             } else if syscall == libc::SYS_read {
@@ -184,7 +196,9 @@ fn wait_for_signal(child: Pid) -> Result<bool, SandboxTracerError> {
                 // now find the file name in /proc/[pid]/[fd]
                 let fd_path = format!("/proc/{}/fd/{}", pid, fd);
                 let filename = std::fs::read_link(fd_path).unwrap();
-                info!("[{}] Read filename = {}", pid, filename.to_str().unwrap());
+                if is_real_path(&filename.to_str().unwrap()) {
+                    info!("[{}] Read filename = {}", pid, filename.to_str().unwrap());
+                }
 
                 ptrace::syscall(pid, None).unwrap();
             } else if syscall == libc::SYS_open {
@@ -192,7 +206,9 @@ fn wait_for_signal(child: Pid) -> Result<bool, SandboxTracerError> {
 
                 if !filename_ptr.is_null() {
                     let filename = read_cstring(pid, filename_ptr).unwrap();
-                    info!("[{}]: Open filename = {}", pid, filename);
+                    if is_real_path(&filename) {
+                        info!("[{}]: Open filename = {}", pid, filename);
+                    }
                 }
 
                 ptrace::syscall(pid, None).unwrap();
@@ -201,7 +217,10 @@ fn wait_for_signal(child: Pid) -> Result<bool, SandboxTracerError> {
 
                 if !filename_ptr.is_null() {
                     let filename = read_cstring(pid, filename_ptr).unwrap();
-                    info!("[{}] Openat filename = {}", pid, filename);
+
+                    if is_real_path(&filename) {
+                        info!("[{}] Openat filename = {}", pid, filename);
+                    }
                 }
 
                 ptrace::syscall(pid, None).unwrap();
@@ -218,7 +237,9 @@ fn wait_for_signal(child: Pid) -> Result<bool, SandboxTracerError> {
 
                 if !filename_ptr.is_null() {
                     let filename = read_cstring(pid, filename_ptr).unwrap();
-                    info!("[{}] Stat filename = {}", pid, filename);
+                    if is_real_path(&filename) {
+                        info!("[{}] Stat filename = {}", pid, filename);
+                    }
                 }
 
                 ptrace::syscall(pid, None).unwrap();
@@ -226,6 +247,8 @@ fn wait_for_signal(child: Pid) -> Result<bool, SandboxTracerError> {
                 // info!("[{}] Other Syscall {}", pid, syscall);
                 ptrace::syscall(pid, None).unwrap();
             }
+
+            //ptrace::syscall(pid, None).unwrap();
 
             Ok(false)
         }
@@ -256,9 +279,9 @@ fn setup_tracing(pid: Pid) -> Result<(), SandboxTracerError> {
         Options::PTRACE_O_TRACEFORK
             .union(Options::PTRACE_O_TRACECLONE)
             .union(Options::PTRACE_O_TRACEVFORK)
-            .union(Options::PTRACE_O_TRACESYSGOOD)
-            .union(Options::PTRACE_O_TRACEEXEC)
-            .union(Options::PTRACE_O_EXITKILL),
+            .union(Options::PTRACE_O_TRACESYSGOOD),
+        // .union(Options::PTRACE_O_TRACEEXEC)
+        // .union(Options::PTRACE_O_EXITKILL),
     )
     .context("Could not set options to follow forks")
     .map_err(SandboxTracerError::Ptrace)

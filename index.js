@@ -6,3 +6,4 @@ setTimeout(() => {
   fs.appendFileSync("hello/world.txt", "Hello World");
   fs.appendFileSync("hello/2342world.txt", "Hello World");
 }, 100);
+
